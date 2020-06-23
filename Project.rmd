@@ -1,0 +1,735 @@
+---
+title: 'Statistics 452: Statistical Learning and Prediction'
+author: "Neda Zolaktaf"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,message=FALSE)
+```
+
+##R version
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+R.version
+```
+##Loading the required libraries 
+````{r, eval=FALSE}
+library(lubridate)
+library(randomForest)
+library(gbm)
+library(dplyr)
+
+library(leaps)
+library(glmnet)
+library(dplyr)
+library(gam)
+library(e1071)
+library(MASS)
+```
+
+##Flights dataset
+```{r}
+library(tidyverse)
+library(nycflights13)
+#help(flights)
+#help(weather)
+#help(airports)
+#help(planes)
+fltrain <- read_csv("fltrain.csv.gz")
+fltrain
+```
+
+
+##Missing Data(Prof Code)
+```{r}
+fl <- fltrain
+for(i in 1:ncol(fl)) {
+  if(typeof(fl[[i]]) == "character") {
+    fl[[i]] <- factor(fl[[i]])
+  }
+}
+
+
+num_miss <- function(x) { sum(is.na(x)) }
+sapply(fl,num_miss)
+
+fl <- fl%>% 
+  select(-year.y,-type,-manufacturer,-model,-engines,-seats, -speed, -engine,-wind_gust,-pressure)
+summary(fl)
+
+fl <- na.omit(fl)
+summary(fl)
+range(fl$dep_delay)
+fivenum(fl$dep_delay)
+quantile(fl$dep_delay,probs = c(0.01,0.05,0.1,0.25,.5,.75,.90,.95,.99))
+mean(fl$dep_delay >= 60) # about 15,000 or 8% of flights
+fl%>% arrange(desc(dep_delay)) %>% head(10) 
+
+Q3 <- function(x) { quantile(x,probs=.75) }
+fl %>% group_by(origin) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(Q3_d)) %>% head(10)
+
+fl %>% group_by(carrier) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(Q3_d)) %>% head(10) 
+fl %>% group_by(origin,carrier) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(Q3_d)) %>% head(10) 
+fl %>% group_by(dest,carrier) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(Q3_d)) %>% head(10) 
+
+fl %>% group_by(month,day) %>% 
+  summarize(n=n(),med_d = mean(dep_delay),max_d = max(dep_delay)) %>% 
+  arrange(desc(med_d)) %>% head(10) # what happened on march 8?
+
+fl %>% mutate(haveprecip = factor(precip>0)) %>% group_by(haveprecip) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(med_d)) %>% head(10) 
+
+den <- nrow(fl)+1
+fl <- fl %>% mutate(dep_delay = rank(dep_delay)/den)
+ ggplot(fl,aes(x=dep_delay)) + geom_histogram(binwidth=.01)
+ 
+ 
+ library(lubridate)
+fl <- fl %>% 
+  mutate(dep_date = make_date(year.x,month,day)) %>% 
+  select(-year.x,-month,-day,-dep_time,-arr_time,-arr_delay,
+         -sched_arr_time,-tailnum,-flight,-name,-air_time,
+         -hour,-minute,-time_hour,-tz,-dst,-tzone) %>%
+  mutate(precip = as.numeric(precip>0))
+
+ggplot(fl,aes(x=dep_date,y=dep_delay)) + geom_point(alpha=.01) + geom_smooth()
+# Definitely non-linear. High in summer, low in fall. Not sure about winter. Looks like
+# some sort of event around the end of 2013, but could just be an end effect.
+ggplot(fl,aes(x=sched_dep_time,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# delays increase throughout the day
+ggplot(fl,aes(x=distance,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+ggplot(fl,aes(x=log(distance),y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# increases with distance -- use log distance
+fl <- mutate(fl,logdistance = log(distance)) %>% select(-distance)
+ggplot(fl,aes(x=temp,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# delays when too hot or too cold
+ggplot(fl,aes(x=dewp,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# similar to temp
+# Etc.
+# Replace alt with log(alt)
+fl <- mutate(fl,logalt = log(alt)) %>% select(-alt)
+
+
+
+
+
+
+
+
+```
+
+
+##Split training set in two for tuning
+```{r}
+set.seed(123)
+tr_size <- ceiling(2*nrow(fl)/3)
+train <- sample(1:nrow(fl),size=tr_size)
+fl_tr <- fl[train,]
+fl_te <- fl[-train,]
+
+# baseline to compare learning methods to:
+var_dd <- var(fl_te$dep_delay)
+var_dd
+
+```
+
+
+
+
+#Gam for regression
+```{r,cache=TRUE}
+library(gam)
+form <- formula(dep_delay ~ s(dep_date) + s(sched_dep_time) + carrier + origin + dest + s(logdistance) +
+                  s(temp) + s(dewp) + s(humid) + s(wind_dir) + s(wind_speed) + precip + s(visib))
+gam_fit <- gam(form, data=fl_tr,family=gaussian)
+saveRDS(gam_fit,"./gam_fit.rds")
+
+gam_fit<-readRDS("./gam_fit.rds")
+summary(gam_fit)
+plot(gam_fit,se=TRUE)
+gam_pred <- predict(gam_fit,newdata=fl_te)
+mse_gam <- mean((fl_te$dep_delay-gam_pred)^2)
+mse_gam
+abs(mse_gam - var_dd)/var_dd
+```
+#changing the features format for the regression models
+```{r,cache=TRUE}
+library(gbm)
+#include this
+dep_date_numeric <- as.numeric(fl_tr$dep_date)
+dep_date_numeric <- dep_date_numeric - mean(dep_date_numeric)
+fl_tr_tem <- mutate(fl_tr,dep_date = dep_date_numeric)
+fl_tr_tem <- mutate(fl_tr_tem, origin = factor(origin), dest = factor(dest), carrier = factor(carrier))
+
+dep_date_numeric <- as.numeric(fl_te$dep_date)
+dep_date_numeric <- dep_date_numeric - mean(dep_date_numeric)
+fl_te_tem <- mutate(fl_te,dep_date = dep_date_numeric)
+fl_te_tem <- mutate(fl_te_tem, origin = factor(origin), dest = factor(dest), carrier = factor(carrier))
+
+```
+
+
+
+
+#boosting
+```{r,cache=TRUE}
+gbm_fit <-gbm(dep_delay ~ .,data=fl_tr_tem,distribution="gaussian",
+              n.trees = 1000, shrinkage = 0.01)
+summary(gbm_fit)
+#
+#dep_date_numeric <- as.numeric(fl_te$dep_date)
+#dep_date_numeric <- dep_date_numeric - mean(dep_date_numeric)
+#fl_te_tem <- mutate(fl_te,dep_date = dep_date_numeric)
+#
+gbm_pred <- predict(gbm_fit,newdata=fl_te_tem,n.trees = 1000)
+mse_gbm <- mean((fl_te_tem$dep_delay-gbm_pred)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+```
+
+Boosting Model without shrinkage
+```{r}
+
+#Caravan.train <- Caravan[train,]
+#Caravan.test <- Caravan[-train,]
+set.seed(1)
+cboost <- gbm(dep_delay ~ ., data=fl_tr_tem, n.trees=1000,distribution = "gaussian")
+summary(cboost)
+saveRDS(cboost,"./Cboost.rds")
+gbm_pred <- predict(cboost,newdata=fl_te_tem,n.trees = 1000)
+mse_gbm <- mean((fl_te_tem$dep_delay-gbm_pred)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+
+
+
+Random Forest
+```{r}
+library(randomForest)
+randomF <- randomForest(dep_delay ~ .-origin-dest, data=fl_tr_tem, ntree=10,mtry=4)
+summary(cboost)
+prediction <- predict(randomF,fl_te_tem)
+
+#mse_gbm <- mean((fl_te_tem$dep_delay-prediction)^2)
+saveRDS(randomF,"./randomF.rds")
+mse_gbm = mean((fl_te_tem$dep_delay-prediction)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+
+## Lasso
+```{r}
+library(glmnet)
+Xfull <- model.matrix(dep_delay~ ., data=fl_tr_tem)
+head(Xfull,n=3)
+Y <- fl_tr_tem$dep_delay
+
+
+lambdas <- 10^{seq(from=-3,to=5,length=100)}
+cv.lafit <- cv.glmnet(Xfull,Y,alpha=1,lambda=lambdas) 
+la.best.lam <- cv.lafit$lambda.1se
+la.best <- glmnet(Xfull,Y,alpha=1,lambda=la.best.lam)
+plot(cv.lafit)
+coef(la.best)
+
+X_te_full <- model.matrix(dep_delay~ ., data=fl_te_tem)
+ll <- glmnet(Xfull,Y,alpha=1,lambda=la.best.lam) 
+saveRDS(ll,"./ll.rds")
+
+gam_fit<-readRDS("./ll.rds")
+
+pred.test=predict(ll,X_te_full)
+#mean((fl_te$dep_delay- pred.test)^2)
+mse_gbm = mean((fl_te$dep_delay-pred.test)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+coef(ll)
+
+
+
+
+```
+
+
+
+## ridge
+```{r}
+library(glmnet)
+Xfull <- model.matrix(dep_delay~ ., data=fl_tr_tem)
+head(Xfull,n=3)
+Y <- fl_tr_tem$dep_delay
+
+lambdas <- 10^{seq(from=-3,to=5,length=100)}
+cv.lafit <- cv.glmnet(Xfull,Y,alpha=0,lambda=lambdas) 
+la.best.lam <- cv.lafit$lambda.1se
+la.best <- glmnet(Xfull,Y,alpha=0,lambda=la.best.lam)
+plot(cv.lafit)
+coef(la.best)
+X_te_full <- model.matrix(dep_delay~ ., data=fl_te_tem)
+ll2 <- glmnet(Xfull,Y,alpha=1,lambda=la.best.lam) 
+
+pred.test=predict(ll2,X_te_full)
+#mean((fl_te$dep_delay- pred.test)^2)
+mse_gbm = mean((fl_te$dep_delay-pred.test)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+
+#SVM For Regression(dont run this:takes too long)
+````{r, eval=FALSE}
+#tuning
+tune.auto <- tune(svm,dep_delay ~ .,data=fl_tr_tem,ranges=list(cost=c(10^{0:1}),gamma=c(0,0.5,1,2)), kernel="radial")
+summary(tune.auto)$performances
+#choosing the best model
+svm.t <- svm(dep_delay ~ .,data=fl_tr_tem,cost=1,gamma=,0.5 , kernel="radial")
+summary(svm.t)
+s.pred=predict(svm.t,fl_te_tem)
+mse_gbm = mean((fl_te_tem$dep_delay-s.pred)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+```
+
+#Reading The test Set
+#For the test set we have to do all the preprocessing so that it would have the same format as the train set
+```{r}
+Test_set <- read_csv("fltest.csv.gz")    
+
+
+#test preprocessing
+fl2 <- Test_set
+for(i in 1:ncol(fl2)) {
+  if(typeof(fl2[[i]]) == "character") {
+    fl2[[i]] <- factor(fl2[[i]])
+  }
+}
+
+num_miss <- function(x) { sum(is.na(x)) }
+sapply(fl2,num_miss)
+
+fl2 <- fl2%>% 
+  select(-year.y,-type,-manufacturer,-model,-engines,-seats, -speed, -engine,-wind_gust,-pressure)
+summary(fl2)
+
+
+fl2 <- na.omit(fl2)
+summary(fl2)
+
+
+range(fl2$dep_delay)
+fivenum(fl2$dep_delay)
+quantile(fl2$dep_delay,probs = c(0.01,0.05,0.1,0.25,.5,.75,.90,.95,.99))
+mean(fl2$dep_delay >= 60) 
+
+fl2%>% arrange(desc(dep_delay)) %>% head(10)
+
+Q3 <- function(x) { quantile(x,probs=.75) }
+fl2 %>% group_by(origin) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(Q3_d)) %>% head(10)
+
+
+
+fl2 %>% group_by(month,day) %>% 
+  summarize(n=n(),med_d = mean(dep_delay),max_d = max(dep_delay)) %>% 
+  arrange(desc(med_d)) %>% head(10)
+
+
+fl2 %>% mutate(haveprecip = factor(precip>0)) %>% group_by(haveprecip) %>% 
+  summarize(n=n(),med_d = median(dep_delay),Q3_d = Q3(dep_delay), max_d = max(dep_delay)) %>% 
+  arrange(desc(med_d)) %>% head(10)
+
+
+den <- nrow(fl2)+1
+fl2 <- fl2 %>% mutate(dep_delay = rank(dep_delay)/den)
+ ggplot(fl2,aes(x=dep_delay)) + geom_histogram(binwidth=.01)
+
+
+
+library(lubridate)
+fl2 <- fl2 %>% 
+  mutate(dep_date = make_date(year.x,month,day)) %>% 
+  select(-year.x,-month,-day,-dep_time,-arr_time,-arr_delay,
+         -sched_arr_time,-tailnum,-flight,-name,-air_time,
+         -hour,-minute,-time_hour,-tz,-dst,-tzone) %>%
+  mutate(precip = as.numeric(precip>0))
+
+
+
+
+ggplot(fl2,aes(x=dep_date,y=dep_delay)) + geom_point(alpha=.01) + geom_smooth()
+# Definitely non-linear. High in summer, low in fall. Not sure about winter. Looks like
+# some sort of event around the end of 2013, but could just be an end effect.
+ggplot(fl2,aes(x=sched_dep_time,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# delays increase throughout the day
+ggplot(fl2,aes(x=distance,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+ggplot(fl2,aes(x=log(distance),y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# increases with distance -- use log distance
+fl2 <- mutate(fl2,logdistance = log(distance)) %>% select(-distance)
+ggplot(fl2,aes(x=temp,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# delays when too hot or too cold
+ggplot(fl2,aes(x=dewp,y=dep_delay)) + geom_point(alpha=0.01) + geom_smooth()
+# similar to temp
+# Etc.
+# Replace alt with log(alt)
+
+
+fl2 <- mutate(fl2,logalt = log(alt)) %>% select(-alt)
+fl2<-fl2[!(fl2$dest=="LEX"),]
+dep_date_numeric <- as.numeric(fl2$dep_date)
+dep_date_numeric <- dep_date_numeric - mean(dep_date_numeric)
+fl3<- mutate(fl2,dep_date = dep_date_numeric)
+fl3 <- mutate(fl3, origin = factor(origin), dest = factor(dest), carrier = factor(carrier))
+
+```
+
+
+
+
+
+
+
+#Gam for test regression
+````{r, eval=FALSE}
+
+gam_pred <- predict(gam_fit,newdata=fl2)
+mse_gam <- mean((fl2$dep_delay-gam_pred)^2)
+mse_gam
+abs(mse_gam - var_dd)/var_dd
+```
+
+
+
+#boosting for test regression
+```{r,cache=TRUE}
+
+gbm_pred <- predict(gbm_fit,newdata=fl3,n.trees = 1000)
+mse_gbm <- mean((fl3$dep_delay-gbm_pred)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+```
+
+#Random Forest for test 
+```{r}
+
+prediction <- predict(randomF,fl3)
+
+mse_gbm = mean((fl3$dep_delay-prediction)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+
+
+## ridge for test
+```{r}
+library(glmnet)
+
+X_te_full <- model.matrix(dep_delay~ ., data=fl3)
+
+
+pred.test=predict(ll2,X_te_full)
+#mean((fl_te$dep_delay- pred.test)^2)
+mse_gbm = mean((fl3$dep_delay-pred.test)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+## Lasso for test
+```{r}
+
+
+X_te_full <- model.matrix(dep_delay~ ., data=fl3)
+#ll <- glmnet(Xfull,Y,alpha=1,lambda=la.best.lam) 
+
+
+
+
+pred.test=predict(ll,X_te_full)
+#mean((fl_te$dep_delay- pred.test)^2)
+mse_gbm = mean((fl3$dep_delay-pred.test)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+coef(ll)
+
+
+```
+
+
+#Boosting Model without shrinkage on test
+```{r}
+
+#Caravan.train <- Caravan[train,]
+#Caravan.test <- Caravan[-train,]
+
+gbm_pred <- predict(cboost,newdata=fl3,n.trees = 1000)
+mse_gbm <- mean((fl3$dep_delay-gbm_pred)^2)
+mse_gbm
+abs(mse_gbm - var_dd)/var_dd
+
+```
+
+***********************************************************PART 2*****************
+Classification
+
+
+#preparing data for classification
+```{r}
+fl_tr_tem_class <- fl_tr_tem %>%
+mutate(dep_delay = factor(dep_delay >median(dep_delay ))) 
+fl_te_tem_class <- fl_te_tem %>%
+mutate(dep_delay = factor(dep_delay >median(dep_delay ))) 
+#this row had to be deleted in the test set
+
+```
+
+
+
+
+#gam as classifier
+```{r}
+library(gam)
+form <- formula(dep_delay ~ s(dep_date) + s(sched_dep_time) + carrier + origin + dest + s(logdistance) +
+                  s(temp) + s(dewp) + s(humid) + s(wind_dir) + s(wind_speed) + precip + s(visib))
+gam_fit2 <- gam(form, family=binomial,data=fl_tr_tem_class) 
+summary(gam_fit2)
+#plot(gam_fit,se=TRUE)
+gam.prediction <- (predict(gam_fit2 ,newdata=fl_te_tem_class,type="response")>0.5)
+
+tt <- table(gam.prediction,fl_te_tem_class$dep_delay)
+
+sum(tt[row(tt)!=col(tt)])/sum(tt)
+sum(tt)
+
+
+```
+
+#Boosting as classifier
+```{r}
+library(gbm)
+set.seed(1)
+w.boost <- gbm(I(dep_delay=="True") ~ ., data=fl_tr_tem_class,n.trees=1000,distribution="bernoulli",shrinkage = 0.1 ) 
+
+# default shrinkage = summary(hboost)
+
+#while doing prectition specifiy number of trees, don't need to use all trees for prediction
+prds <- (predict(w.boost,newdata=fl_te_tem_class,n.trees=300,type="response")>0.5)
+
+
+tt1 <- table(prds,fl_te_tem_class$dep_delay)
+
+sum(tt1[row(tt1)!=col(tt1)])/sum(tt1)
+
+#.19
+```
+
+
+#Boosting without shrinkage as classifier
+```{r}
+library(gbm)
+set.seed(1)
+w.boost <- gbm(I(dep_delay=="True") ~ ., data=fl_tr_tem_class,n.trees=1000,distribution="bernoulli" ) 
+
+# default shrinkage = summary(hboost)
+
+#while doing prectition specifiy number of trees, don't need to use all trees for prediction
+prds <- (predict(w.boost,newdata=fl_te_tem_class,n.trees=300,type="response")>0.5)
+
+
+tt1 <- table(prds,fl_te_tem_class$dep_delay)
+
+sum(tt1[row(tt1)!=col(tt1)])/sum(tt1)
+
+#.19
+```
+
+
+#Naive Bayes as classifier
+```{r}
+library(e1071)
+set.seed(123)
+nvb <- naiveBayes(dep_delay~., data=fl_tr_tem_class)
+nvbpred <- predict(nvb,fl_te_tem_class)
+#mean(fl_te_tem$dep_delay == nvb.pred)
+tt2 <- table(nvbpred,fl_te_tem$dep_delay)
+sum(tt2[row(tt2)!=col(tt2)])/sum(tt2)
+```
+
+
+#RandomForest as classifier
+```{r}
+library(randomForest)
+set.seed(123)
+randomF2<- randomForest(dep_delay~.-origin-dest,data=fl_tr_tem_class, ntree=10,mtry=4)
+rand.prediction <- predict(randomF2,newdata=fl_te_tem_class, type="class")
+tt3 <- table(rand.prediction,fl_te_tem_class$dep_delay)
+sum(tt3[row(tt3)!=col(tt3)])/sum(tt3)
+
+```
+0.3693805
+
+
+
+#SVM as classifier kernel radial
+````{r, eval=FALSE}
+library(e1071)
+svm.heart <- svm(dep_delay~.,type="C-classification",cost=1,data=fl_tr_tem,kernel="radial",gamma=1/2)
+pp <- predict(svm.heart,newdata=fl_te_tem)
+saveRDS(pp,"./pp.rds")
+pp<-readRDS("./pp.rds")
+tt5<- table(pp,fl_te_tem$dep_delay)
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+```
+
+#SVM as classifier with kernel linear
+````{r, eval=FALSE}
+library(e1071)
+svm.heart <- svm(dep_delay~.,type="C-classification",cost=1,data=fl_tr_tem,kernel="linear",gamma=1/2)
+saveRDS(pp,"./linearmodel.rds")
+pp <- predict(svm.heart,newdata=fl_te_tem)
+tt5<- table(pp,fl_te_tem$dep_delay)
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+```
+
+
+#Logistic Regression
+
+```{r}
+
+log_fit <- glm(dep_delay~.,data=fl_tr_tem_class, family=binomial())
+predDirection = (predict(log_fit,fl_te_tem_class,type="response")>0.5)
+tt5 <- table(predDirection,fl_te_tem_class$dep_delay)
+
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+
+```
+
+#LDA for classification
+```{r}
+
+library(MASS)
+lda_fit <- lda(dep_delay~.,data=fl_tr_tem_class, family=binomial())
+e.preds <-predict(lda_fit,fl_te_tem_class,type="response")
+mean(e.preds$class== fl_te_tem_class$dep_delay)
+table(e.preds$class,fl_te_tem_class$dep_delay)
+```
+
+
+#preparing data for classification test
+```{r}
+fl_tr_tem_class_test <- fl3  %>%
+mutate(dep_delay = factor(dep_delay >median(dep_delay ))) 
+fl_te_tem_class_test <- fl3  %>%
+mutate(dep_delay = factor(dep_delay >median(dep_delay ))) 
+fl_te_tem_class_test<-fl_te_tem_class_test[!(fl_te_tem_class_test$dest=="LEX"),]
+```
+
+
+
+#SVM as classifier kernel radial testing
+````{r, eval=FALSE}
+
+pp <- predict(svm.heart,newdata=fl_tr_tem_class_test)
+tt5<- table(pp,fl_te_tem$dep_delay)
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+```
+
+
+
+#SVM as classifier kernel linear testing
+````{r, eval=FALSE}
+pp <- predict(svm.heart,newdata=fl_tr_tem_class_test)
+tt5<- table(pp,fl_te_tem$dep_delay)
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+```
+
+
+
+#LDA for testing
+```{r}
+
+library(MASS)
+e.preds <-predict(lda_fit,fl_te_tem_class_test,type="response")
+mean(e.preds$class== fl_te_tem_class_test$dep_delay)
+table(e.preds$class,fl_te_tem_class_test$dep_delay)
+```
+
+#Logistic Regression
+
+```{r}
+
+predDirection = (predict(log_fit,fl_te_tem_class_test,type="response")>0.5)
+tt5 <- table(predDirection,fl_te_tem_class_test$dep_delay)
+
+sum(tt5[row(tt5)!=col(tt5)])/sum(tt5)
+
+```
+
+```{r}
+library(randomForest)
+
+rand.prediction <- predict(randomF2,newdata=fl_te_tem_class_test, type="class")
+tt3 <- table(rand.prediction,fl_te_tem_class_test$dep_delay)
+sum(tt3[row(tt3)!=col(tt3)])/sum(tt3)
+
+```
+
+#Naive Bayes as classifier
+```{r}
+
+nvbpred <- predict(nvb,fl_te_tem_class_test)
+#mean(fl_te_tem$dep_delay == nvb.pred)
+tt2 <- table(nvbpred,fl_te_tem_class_test$dep_delay)
+sum(tt2[row(tt2)!=col(tt2)])/sum(tt2)
+```
+
+#Boosting without shrinkage as classifier
+```{r}
+library(gbm)
+set.seed(1)
+
+prds <- (predict(w.boost,newdata=fl_te_tem_class_test,n.trees=300,type="response")>0.5)
+
+
+tt1 <- table(prds,fl_te_tem_class_test$dep_delay)
+
+sum(tt1[row(tt1)!=col(tt1)])/sum(tt1)
+
+#.19
+```
+
+#gam as classifier
+```{r}
+
+gam.prediction <- (predict(gam_fit2 ,newdata=fl_te_tem_class_test,type="response")>0.5)
+
+tt <- table(gam.prediction,fl_te_tem_class_test$dep_delay)
+
+sum(tt[row(tt)!=col(tt)])/sum(tt)
+sum(tt)
+
+
+```
+
